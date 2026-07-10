@@ -101,6 +101,7 @@ export async function multipartUpload({
   file,
   token,
   apiKey,
+  parentId,
   onProgress,
   signal,
   presignBatchSize = 10,
@@ -115,6 +116,7 @@ export async function multipartUpload({
         fileName: file.name,
         fileSize: file.size,
         mimeType: file.type || "application/octet-stream",
+        ...(parentId ? { parentId } : {}),
       },
       token,
       apiKey,
@@ -254,4 +256,40 @@ export async function unlockShareDownload({ slug, token }) {
 
 export async function getShareDownloadUrl(slug) {
   return apiFetch(`/api/share/${slug}/download`);
+}
+
+export async function listDriveItems({ token, parentId }) {
+  const query = parentId ? `?parentId=${encodeURIComponent(parentId)}` : "";
+  return apiFetch(`/api/drive/items${query}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function createDriveFolder({ token, name, parentId }) {
+  return apiFetch("/api/drive/folders", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name, parentId }),
+  });
+}
+
+export async function moveDriveItem({ token, itemId, targetParentId }) {
+  return apiFetch(`/api/drive/items/${itemId}/move`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ targetParentId }),
+  });
+}
+
+export async function deleteDriveItem({ token, itemId }) {
+  return apiFetch(`/api/drive/items/${itemId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function getDriveBreadcrumbs({ token, itemId }) {
+  return apiFetch(`/api/drive/breadcrumbs/${itemId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }

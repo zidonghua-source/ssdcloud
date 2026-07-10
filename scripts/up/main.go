@@ -20,6 +20,7 @@ const (
 	userAgent      = "ssdcloud-up/1.0"
 	envToken       = "SSD_TOKEN"
 	envAPIKey      = "SSD_API_KEY"
+	maxPartUploadAttempts = 5
 )
 
 type initiateUploadRequest struct {
@@ -150,42 +151,56 @@ func main() {
 	parts := make([]uploadedPart, 0, initResp.Upload.TotalPart)
 
 	for partNumber := 1; partNumber <= initResp.Upload.TotalPart; partNumber++ {
-		var presignResp presignResponse
-		err = authedJSON(
-			client,
-			http.MethodPost,
-			fmt.Sprintf("%s/api/files/upload/%s/presign", baseURL, initResp.Upload.ID),
-			uploadAuth,
-			map[string][]int{"partNumbers": []int{partNumber}},
-			&presignResp,
-		)
-		if err != nil {
-			failUploadStep(fmt.Sprintf("Presign part %d failed", partNumber), err, uploadAuth)
-		}
-
-		partURL := presignResp.URLs[fmt.Sprintf("%d", partNumber)]
-		if partURL == "" {
-			failf("Missing presigned URL for part %d", partNumber)
-		}
-
 		partOffset := int64(partNumber-1) * initResp.Upload.PartSize
 		partSize := minInt64(initResp.Upload.PartSize, totalSize-partOffset)
 		if partSize <= 0 {
 			failf("Invalid part size at part %d", partNumber)
 		}
 
-		etag, err := putPartWithProgress(client, partURL, io.NewSectionReader(file, partOffset, partSize), partSize, func(sent int64) {
-			now := time.Now()
-			if now.Sub(lastPrint) < 100*time.Millisecond && sent != partSize {
-				return
+		var etag string
+		var partErr error
+		for attempt := 1; attempt <= maxPartUploadAttempts; attempt++ {
+			var presignResp presignResponse
+			err = authedJSON(
+				client,
+				http.MethodPost,
+				fmt.Sprintf("%s/api/files/upload/%s/presign", baseURL, initResp.Upload.ID),
+				uploadAuth,
+				map[string][]int{"partNumbers": []int{partNumber}},
+				&presignResp,
+			)
+			if err != nil {
+				failUploadStep(fmt.Sprintf("Presign part %d failed", partNumber), err, uploadAuth)
 			}
-			lastPrint = now
-			current := uploadedBytes + sent
-			percent := float64(current) * 100 / float64(totalSize)
-			fmt.Printf("\rUpload: %6.2f%%", percent)
-		})
-		if err != nil {
-			failf("Upload part %d failed: %v", partNumber, err)
+
+			partURL := presignResp.URLs[fmt.Sprintf("%d", partNumber)]
+			if partURL == "" {
+				failf("Missing presigned URL for part %d", partNumber)
+			}
+
+			etag, err = putPartWithProgress(client, partURL, io.NewSectionReader(file, partOffset, partSize), partSize, func(sent int64) {
+				now := time.Now()
+				if now.Sub(lastPrint) < 100*time.Millisecond && sent != partSize {
+					return
+				}
+				lastPrint = now
+				current := uploadedBytes + sent
+				percent := float64(current) * 100 / float64(totalSize)
+				fmt.Printf("\rUpload: %6.2f%%", percent)
+			})
+			if err == nil {
+				partErr = nil
+				break
+			}
+
+			partErr = err
+			if attempt < maxPartUploadAttempts {
+				fmt.Fprintf(os.Stderr, "\nWarning: upload part %d attempt %d/%d failed: %v\n", partNumber, attempt, maxPartUploadAttempts, err)
+				time.Sleep(retryDelay(attempt))
+			}
+		}
+		if partErr != nil {
+			failf("Upload part %d failed after %d attempts: %v", partNumber, maxPartUploadAttempts, partErr)
 		}
 
 		uploadedBytes += partSize
@@ -349,6 +364,17 @@ func minInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		return 500 * time.Millisecond
+	}
+	delay := time.Duration(1<<uint(attempt-1)) * time.Second
+	if delay > 8*time.Second {
+		return 8 * time.Second
+	}
+	return delay
 }
 
 func failUploadStep(prefix string, err error, auth authCredential) {

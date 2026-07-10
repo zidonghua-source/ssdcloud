@@ -2,13 +2,22 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   apiFetch,
+  createDriveFolder,
+  deleteDriveItem,
+  getDriveBreadcrumbs,
   getShareDownloadUrl,
   getShareInfo,
   getUploadQuote,
+  listDriveItems,
+  moveDriveItem,
   multipartUpload,
   unlockShareDownload,
   upsertFileShare,
 } from "./api";
+import { DriveBreadcrumb } from "./components/drive/DriveBreadcrumb";
+import { DriveItemGrid } from "./components/drive/DriveItemGrid";
+import { DriveLayout } from "./components/drive/DriveLayout";
+import { DriveToolbar } from "./components/drive/DriveToolbar";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
 import { Button } from "./components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card";
@@ -537,9 +546,14 @@ function Dashboard({ auth }) {
             <CardTitle>Dashboard</CardTitle>
             <CardDescription>Email: {auth.user?.email || "-"}</CardDescription>
           </div>
-          <Button variant="secondary" onClick={logout}>
-            Logout
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="outline" asChild>
+              <Link to="/drive">Open Drive</Link>
+            </Button>
+            <Button variant="secondary" onClick={logout}>
+              Logout
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">Balance: {auth.user?.balance ?? 0}</p>
@@ -931,6 +945,186 @@ function SharePage({ auth }) {
   );
 }
 
+function DrivePage({ auth }) {
+  const { itemId } = useParams();
+  const navigate = useNavigate();
+  const [items, setItems] = useState([]);
+  const [breadcrumbs, setBreadcrumbs] = useState([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [newFolderName, setNewFolderName] = useState("");
+  const [uploadFile, setUploadFile] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [searchValue, setSearchValue] = useState("");
+
+  const currentParentId = itemId || null;
+
+  async function loadDrive() {
+    try {
+      setError("");
+      setLoading(true);
+      const token = auth.token || localStorage.getItem("accessToken") || "";
+      const [listData, breadcrumbData] = await Promise.all([
+        listDriveItems({ token, parentId: currentParentId }),
+        currentParentId
+          ? getDriveBreadcrumbs({ token, itemId: currentParentId })
+          : Promise.resolve({ breadcrumbs: [] }),
+      ]);
+      setItems(listData.items || []);
+      setBreadcrumbs(breadcrumbData.breadcrumbs || []);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadDrive();
+  }, [currentParentId]);
+
+  function openItem(item) {
+    if (item.type === "folder") {
+      navigate(`/drive/${item.id}`);
+      return;
+    }
+  }
+
+  async function createFolder() {
+    if (!newFolderName.trim()) return;
+    try {
+      setError("");
+      const token = auth.token || localStorage.getItem("accessToken") || "";
+      await createDriveFolder({ token, name: newFolderName, parentId: currentParentId || undefined });
+      setNewFolderName("");
+      await loadDrive();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function deleteItem(item) {
+    try {
+      setError("");
+      const token = auth.token || localStorage.getItem("accessToken") || "";
+      await deleteDriveItem({ token, itemId: item.id });
+      await loadDrive();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function moveFolderToRoot(item) {
+    try {
+      setError("");
+      const token = auth.token || localStorage.getItem("accessToken") || "";
+      await moveDriveItem({ token, itemId: item.id, targetParentId: null });
+      await loadDrive();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function uploadIntoCurrentFolder() {
+    if (!uploadFile || isUploading) return;
+    try {
+      setError("");
+      setIsUploading(true);
+      await multipartUpload({
+        file: uploadFile,
+        token: auth.token,
+        parentId: currentParentId || undefined,
+      });
+      setUploadFile(null);
+      await auth.fetchMe(auth.token);
+      await loadDrive();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsUploading(false);
+    }
+  }
+
+  const filteredItems = items.filter((item) => item.name.toLowerCase().includes(searchValue.toLowerCase()));
+
+  return (
+    <DriveLayout
+      sidebar={
+        <div className="space-y-2 text-sm">
+          <Button className="w-full justify-start" onClick={() => navigate("/drive")}>
+            My Drive
+          </Button>
+          <Button className="w-full justify-start" variant="outline" asChild>
+            <Link to="/dashboard">Dashboard</Link>
+          </Button>
+          <Button className="w-full justify-start" variant="ghost" disabled>
+            Shared (Phase 2)
+          </Button>
+          <Button className="w-full justify-start" variant="ghost" disabled>
+            Recent (Phase 2)
+          </Button>
+        </div>
+      }
+      toolbar={
+        <DriveToolbar
+          title="My Drive"
+          onSearchChange={setSearchValue}
+          actions={
+            <>
+              <Input
+                placeholder="New folder name"
+                value={newFolderName}
+                onChange={(e) => setNewFolderName(e.target.value)}
+              />
+              <Button onClick={createFolder}>Create folder</Button>
+            </>
+          }
+        />
+      }
+    >
+      <div className="space-y-3">
+        <DriveBreadcrumb
+          items={breadcrumbs.filter((item) => item.type === "folder")}
+          onOpenRoot={() => navigate("/drive")}
+          onOpenItem={(item) => navigate(`/drive/${item.id}`)}
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Input type="file" onChange={(e) => setUploadFile(e.target.files?.[0] || null)} />
+          <Button onClick={uploadIntoCurrentFolder} disabled={!uploadFile || isUploading}>
+            {isUploading ? "Uploading..." : "Upload to this folder"}
+          </Button>
+        </div>
+
+        {error && (
+          <Alert variant="destructive">
+            <AlertTitle>Drive action failed</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {loading ? (
+          <p className="text-sm text-muted-foreground">Loading drive...</p>
+        ) : (
+          <div className="space-y-2">
+            <DriveItemGrid items={filteredItems} onOpenItem={openItem} onDeleteItem={deleteItem} />
+            {currentParentId &&
+              filteredItems
+                .filter((item) => item.type === "folder")
+                .map((item) => (
+                  <div key={`move-${item.id}`} className="text-xs text-muted-foreground">
+                    <Button size="sm" variant="ghost" onClick={() => moveFolderToRoot(item)}>
+                      Move "{item.name}" to root
+                    </Button>
+                  </div>
+                ))}
+          </div>
+        )}
+      </div>
+    </DriveLayout>
+  );
+}
+
 function ProtectedRoute({ auth, children }) {
   if (!auth.isAuthenticated) {
     return <Navigate to="/login" replace />;
@@ -947,6 +1141,22 @@ export default function App() {
       <Route path="/register" element={<Register auth={auth} />} />
       <Route path="/login" element={<Login auth={auth} />} />
       <Route path="/share/:slug" element={<SharePage auth={auth} />} />
+      <Route
+        path="/drive"
+        element={
+          <ProtectedRoute auth={auth}>
+            <DrivePage auth={auth} />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/drive/:itemId"
+        element={
+          <ProtectedRoute auth={auth}>
+            <DrivePage auth={auth} />
+          </ProtectedRoute>
+        }
+      />
       <Route
         path="/dashboard"
         element={

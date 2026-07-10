@@ -22,6 +22,7 @@ const pendingUploadSchema = new mongoose.Schema(
     apiKeyPrefix: { type: String, default: null },
     clientIp: { type: String, default: null },
     userAgent: { type: String, default: null },
+    driveParentId: { type: mongoose.Schema.Types.ObjectId, ref: "DriveItem", default: null, index: true },
   },
   { timestamps: true }
 );

@@ -12,12 +12,14 @@ import { requireAuth, requireUploadAuth } from "./middleware/auth.js";
 import { validateBody } from "./middleware/validate.js";
 import { ApiKey } from "./models/ApiKey.js";
 import { DownloadUnlock } from "./models/DownloadUnlock.js";
+import { DriveItem } from "./models/DriveItem.js";
 import { FileObject } from "./models/FileObject.js";
 import { PendingUpload } from "./models/PendingUpload.js";
 import { ShareLink } from "./models/ShareLink.js";
 import { User } from "./models/User.js";
 import { buildCustomApiKey, generateApiKey, getApiKeyPrefix, hashApiKey } from "./services/apiKeys.js";
 import { calcUploadCost } from "./services/billing.js";
+import { normalizeOptionalParentId, sortDriveItems } from "./services/driveItems.js";
 import { clampShareTtlSeconds, computeSignedDownloadTtlSeconds, isShareExpired } from "./services/shareLinks.js";
 import {
   abortMultipartUpload,
@@ -65,6 +67,7 @@ const initiateMultipartSchema = z.object({
   fileName: z.string().trim().min(1).max(255),
   fileSize: z.number().int().positive(),
   mimeType: z.string().trim().min(1).max(255).default("application/octet-stream"),
+  parentId: z.string().trim().optional(),
 });
 
 const presignMultipartSchema = z.object({
@@ -87,6 +90,15 @@ const updateShareSchema = z.object({
   ttlSeconds: z.number().int().positive().optional(),
   downloadCostToken: z.number().int().min(0).default(0),
   isActive: z.boolean().optional(),
+});
+
+const createFolderSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  parentId: z.string().trim().optional(),
+});
+
+const moveDriveItemSchema = z.object({
+  targetParentId: z.string().trim().nullable().optional(),
 });
 
 const authLimiter = rateLimit({
@@ -215,6 +227,86 @@ function toShareSummary(req, share) {
     isExpired,
     whitelistCount: Array.isArray(share.whitelistIps) ? share.whitelistIps.length : 0,
   };
+}
+
+function mapDriveItemResponse(item, fileById = new Map()) {
+  const file = item.fileObjectId ? fileById.get(String(item.fileObjectId)) || null : null;
+  return {
+    id: item._id,
+    type: item.type,
+    name: item.name,
+    parentId: item.parentId,
+    fileObjectId: item.fileObjectId,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    file: file
+      ? {
+          id: file._id,
+          originalName: file.originalName,
+          sizeBytes: file.sizeBytes,
+          mimeType: file.mimeType,
+          costCharged: file.costCharged,
+          createdAt: file.createdAt,
+        }
+      : null,
+  };
+}
+
+async function ensureDriveItemsForUser(userId) {
+  const files = await FileObject.find({ userId }).select("_id originalName createdAt updatedAt");
+  if (files.length === 0) {
+    return;
+  }
+
+  const existing = await DriveItem.find({ ownerUserId: userId, type: "file" }).select("fileObjectId");
+  const existingSet = new Set(existing.map((item) => String(item.fileObjectId)));
+
+  const toInsert = files
+    .filter((file) => !existingSet.has(String(file._id)))
+    .map((file) => ({
+      ownerUserId: userId,
+      type: "file",
+      name: file.originalName,
+      parentId: null,
+      fileObjectId: file._id,
+      createdAt: file.createdAt,
+      updatedAt: file.updatedAt,
+    }));
+
+  if (toInsert.length > 0) {
+    try {
+      await DriveItem.insertMany(toInsert, { ordered: false });
+    } catch {
+      // Ignore duplicate races from concurrent requests.
+    }
+  }
+}
+
+async function resolveOwnedFolderOrRoot(userId, parentId) {
+  const normalized = normalizeOptionalParentId(parentId);
+  if (!normalized) {
+    return null;
+  }
+  if (!mongoose.isValidObjectId(normalized)) {
+    return "__invalid__";
+  }
+  const folder = await DriveItem.findOne({ _id: normalized, ownerUserId: userId, type: "folder" });
+  return folder || "__missing__";
+}
+
+async function wouldCreateFolderCycle(ownerUserId, movingItemId, targetParentId) {
+  let cursor = targetParentId;
+  while (cursor) {
+    if (String(cursor) === String(movingItemId)) {
+      return true;
+    }
+    const node = await DriveItem.findOne({ _id: cursor, ownerUserId }).select("parentId");
+    if (!node) {
+      break;
+    }
+    cursor = node.parentId;
+  }
+  return false;
 }
 
 app.use(
@@ -392,6 +484,149 @@ app.delete("/api/keys/:id", requireAuth, async (req, res) => {
   key.revokedAt = new Date();
   await key.save();
   return res.json({ message: "Key revoked" });
+});
+
+app.get("/api/drive/items", requireAuth, async (req, res) => {
+  await ensureDriveItemsForUser(req.user._id);
+
+  const parentIdParam = normalizeOptionalParentId(req.query.parentId);
+  const parent = await resolveOwnedFolderOrRoot(req.user._id, parentIdParam);
+  if (parent === "__invalid__") {
+    return res.status(400).json({ message: "Invalid parentId" });
+  }
+  if (parent === "__missing__") {
+    return res.status(404).json({ message: "Parent folder not found" });
+  }
+
+  const parentId = parent ? parent._id : null;
+  const rawItems = await DriveItem.find({ ownerUserId: req.user._id, parentId }).lean();
+  const items = sortDriveItems(rawItems);
+
+  const fileIds = items.filter((item) => item.type === "file" && item.fileObjectId).map((item) => item.fileObjectId);
+  const files = fileIds.length
+    ? await FileObject.find({ _id: { $in: fileIds }, userId: req.user._id })
+        .select("originalName sizeBytes mimeType costCharged createdAt")
+        .lean()
+    : [];
+  const fileById = new Map(files.map((file) => [String(file._id), file]));
+
+  return res.json({
+    parentId,
+    items: items.map((item) => mapDriveItemResponse(item, fileById)),
+  });
+});
+
+app.post("/api/drive/folders", requireAuth, validateBody(createFolderSchema), async (req, res) => {
+  const parent = await resolveOwnedFolderOrRoot(req.user._id, req.body.parentId);
+  if (parent === "__invalid__") {
+    return res.status(400).json({ message: "Invalid parentId" });
+  }
+  if (parent === "__missing__") {
+    return res.status(404).json({ message: "Parent folder not found" });
+  }
+
+  const folder = await DriveItem.create({
+    ownerUserId: req.user._id,
+    type: "folder",
+    name: req.body.name,
+    parentId: parent ? parent._id : null,
+  });
+  return res.status(201).json({
+    item: mapDriveItemResponse(folder),
+  });
+});
+
+app.patch("/api/drive/items/:id/move", requireAuth, validateBody(moveDriveItemSchema), async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid item id" });
+  }
+
+  const item = await DriveItem.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+  if (!item) {
+    return res.status(404).json({ message: "Drive item not found" });
+  }
+
+  const targetParent = await resolveOwnedFolderOrRoot(req.user._id, req.body.targetParentId);
+  if (targetParent === "__invalid__") {
+    return res.status(400).json({ message: "Invalid targetParentId" });
+  }
+  if (targetParent === "__missing__") {
+    return res.status(404).json({ message: "Target folder not found" });
+  }
+
+  const targetParentId = targetParent ? targetParent._id : null;
+  if (String(item._id) === String(targetParentId)) {
+    return res.status(400).json({ message: "Cannot move item into itself" });
+  }
+  if (item.type === "folder" && targetParentId) {
+    const hasCycle = await wouldCreateFolderCycle(req.user._id, item._id, targetParentId);
+    if (hasCycle) {
+      return res.status(400).json({ message: "Cannot move folder into its child" });
+    }
+  }
+
+  item.parentId = targetParentId;
+  await item.save();
+  return res.json({ item: mapDriveItemResponse(item) });
+});
+
+app.delete("/api/drive/items/:id", requireAuth, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid item id" });
+  }
+
+  const item = await DriveItem.findOne({ _id: req.params.id, ownerUserId: req.user._id });
+  if (!item) {
+    return res.status(404).json({ message: "Drive item not found" });
+  }
+
+  if (item.type === "folder") {
+    const childCount = await DriveItem.countDocuments({ ownerUserId: req.user._id, parentId: item._id });
+    if (childCount > 0) {
+      return res.status(409).json({ message: "Folder is not empty" });
+    }
+    await DriveItem.deleteOne({ _id: item._id });
+    return res.json({ message: "Folder deleted" });
+  }
+
+  if (item.fileObjectId) {
+    const file = await FileObject.findOne({ _id: item.fileObjectId, userId: req.user._id });
+    if (file) {
+      await FileObject.deleteOne({ _id: file._id });
+      await ShareLink.deleteOne({ fileId: file._id });
+      await deleteFromStorage(file.objectKey);
+    }
+  }
+  await DriveItem.deleteOne({ _id: item._id });
+  return res.json({ message: "File deleted" });
+});
+
+app.get("/api/drive/breadcrumbs/:id", requireAuth, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(400).json({ message: "Invalid item id" });
+  }
+
+  const item = await DriveItem.findOne({ _id: req.params.id, ownerUserId: req.user._id }).lean();
+  if (!item) {
+    return res.status(404).json({ message: "Drive item not found" });
+  }
+
+  const breadcrumbs = [];
+  let cursor = item;
+  while (cursor) {
+    breadcrumbs.unshift({
+      id: cursor._id,
+      name: cursor.name,
+      type: cursor.type,
+      parentId: cursor.parentId,
+    });
+    if (!cursor.parentId) {
+      break;
+    }
+    cursor = await DriveItem.findOne({ _id: cursor.parentId, ownerUserId: req.user._id }).lean();
+  }
+
+  return res.json({ breadcrumbs });
 });
 
 app.post("/api/files/:id/share", requireAuth, validateBody(updateShareSchema), async (req, res) => {
@@ -624,6 +859,13 @@ app.post(
       fileSize: req.body?.fileSize,
     });
     const { fileName, fileSize, mimeType } = req.body;
+    const parentFolder = await resolveOwnedFolderOrRoot(req.user._id, req.body.parentId);
+    if (parentFolder === "__invalid__") {
+      return res.status(400).json({ message: "Invalid parentId" });
+    }
+    if (parentFolder === "__missing__") {
+      return res.status(404).json({ message: "Parent folder not found" });
+    }
     let uploadId = null;
     let objectKey = null;
 
@@ -664,6 +906,7 @@ app.post(
         costCharged: cost,
         status: "pending",
         ...getRequestMetadata(req),
+        driveParentId: parentFolder ? parentFolder._id : null,
       });
 
       return res.status(201).json({
@@ -799,6 +1042,14 @@ app.post(
         userAgent: pendingUpload.userAgent || requestMeta.userAgent,
       });
 
+      await DriveItem.create({
+        ownerUserId: req.user._id,
+        type: "file",
+        name: file.originalName,
+        parentId: pendingUpload.driveParentId || null,
+        fileObjectId: file._id,
+      });
+
       pendingUpload.status = "completed";
       await pendingUpload.save();
 
@@ -919,6 +1170,7 @@ app.delete("/api/files/:id", requireAuth, async (req, res) => {
     }
 
     await FileObject.deleteOne({ _id: file._id }, { session });
+    await DriveItem.deleteOne({ ownerUserId: req.user._id, fileObjectId: file._id }, { session });
     await session.commitTransaction();
     session.endSession();
 

@@ -1153,7 +1153,7 @@ app.get("/api/files/:id/download", requireAuth, async (req, res) => {
   if (!file) {
     return res.status(404).json({ message: "File not found" });
   }
-  const url = await getSignedDownloadUrl(file.objectKey);
+  const url = await getSignedDownloadUrl(file.objectKey, undefined, file.originalName);
   return res.json({ url });
 });
 

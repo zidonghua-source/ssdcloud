@@ -86,8 +86,17 @@ export async function deleteFromStorage(objectKey) {
   await client.send(command);
 }
 
-export async function getSignedDownloadUrl(objectKey, expiresInSeconds = 60) {
-  const command = new GetObjectCommand({ Bucket: config.s3Bucket, Key: objectKey });
+export async function getSignedDownloadUrl(objectKey, expiresInSeconds = 60, fileName) {
+  const params = { Bucket: config.s3Bucket, Key: objectKey };
+  if (fileName) {
+    const name = fileName.replace(/[\x00-\x1f\x7f/\\]/g, "_");
+    const fallback = name.replace(/[^\x20-\x7e]|["%]/g, "_");
+    const encodedName = encodeURIComponent(name).replace(/['()*]/g, (char) =>
+      `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+    params.ResponseContentDisposition = `attachment; filename="${fallback}"; filename*=UTF-8''${encodedName}`;
+  }
+  const command = new GetObjectCommand(params);
   return getSignedUrl(client, command, { expiresIn: expiresInSeconds });
 }
 

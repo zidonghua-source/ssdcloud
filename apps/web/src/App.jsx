@@ -432,7 +432,7 @@ function Dashboard({ auth }) {
   async function downloadFile(id) {
     try {
       const data = await authedFetch(`/api/files/${id}/download`);
-      window.open(data.url, "_blank");
+      window.location.assign(data.url);
     } catch (err) {
       setError(err.message);
     }
@@ -956,6 +956,7 @@ function DrivePage({ auth }) {
   const [uploadFile, setUploadFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
   const [searchValue, setSearchValue] = useState("");
+  const [downloadingFileId, setDownloadingFileId] = useState(null);
 
   const currentParentId = itemId || null;
 
@@ -1011,6 +1012,22 @@ function DrivePage({ auth }) {
       await loadDrive();
     } catch (err) {
       setError(err.message);
+    }
+  }
+
+  async function downloadDriveFile(fileId) {
+    try {
+      setError("");
+      setDownloadingFileId(fileId);
+      const token = auth.token || localStorage.getItem("accessToken") || "";
+      const { url } = await apiFetch(`/api/files/${fileId}/download`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      window.location.assign(url);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDownloadingFileId(null);
     }
   }
 
@@ -1107,7 +1124,13 @@ function DrivePage({ auth }) {
           <p className="text-sm text-muted-foreground">Loading drive...</p>
         ) : (
           <div className="space-y-2">
-            <DriveItemGrid items={filteredItems} onOpenItem={openItem} onDeleteItem={deleteItem} />
+            <DriveItemGrid
+              items={filteredItems}
+              onOpenItem={openItem}
+              onDeleteItem={deleteItem}
+              onDownloadItem={downloadDriveFile}
+              downloadingFileId={downloadingFileId}
+            />
             {currentParentId &&
               filteredItems
                 .filter((item) => item.type === "folder")
